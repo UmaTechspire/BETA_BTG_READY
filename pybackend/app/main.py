@@ -71,10 +71,12 @@ from .routers import petty_cash
 app.include_router(petty_cash.router)
 
 from .routers import overdraft
-app.include_router(overdraft.router)
-
 from .routers import salescommissionreport
+from .routers import opening_balance
+
+app.include_router(overdraft.router)
 app.include_router(salescommissionreport.router)
+app.include_router(opening_balance.router)
 # Auto-create new tables (e.g. tbl_overdraft) if they don't exist yet
 from .models.overdraft import TblOverDraft  # noqa: ensure model is registered
 @app.on_event("startup")

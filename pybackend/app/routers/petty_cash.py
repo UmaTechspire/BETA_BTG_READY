@@ -256,6 +256,22 @@ async def create_pettycash(
             db.add(item)
             
         await db.commit()
+        
+        # Trigger recalculation of monthly balances
+        if header.ExpDate:
+            try:
+                from ..services.opening_balance_service import get_or_create_monthly_balance
+                await get_or_create_monthly_balance(
+                    db=db,
+                    module_name="PETTY_CASH",
+                    org_id=header.OrgId or 1,
+                    branch_id=header.BranchId or 1,
+                    currency_id=header.currencyid,
+                    target_date=header.ExpDate
+                )
+            except Exception as e_bal:
+                print(f"Error recalculating monthly balance: {e_bal}")
+
         # Return the first item's data or summary
         return {"status": True, "data": row_to_dict(items_to_save[0])}
     except HTTPException:
@@ -421,6 +437,22 @@ async def update_pettycash(
             db.add(item)
             
         await db.commit()
+
+        # Trigger recalculation of monthly balances
+        if header.ExpDate:
+            try:
+                from ..services.opening_balance_service import get_or_create_monthly_balance
+                await get_or_create_monthly_balance(
+                    db=db,
+                    module_name="PETTY_CASH",
+                    org_id=header.OrgId or 1,
+                    branch_id=header.BranchId or 1,
+                    currency_id=header.currencyid,
+                    target_date=header.ExpDate
+                )
+            except Exception as e_bal:
+                print(f"Error recalculating monthly balance: {e_bal}")
+
         return {"status": True, "message": "Batch update success"}
     else:
         # Single record update (fallback)
@@ -450,6 +482,22 @@ async def update_pettycash(
         obj.exchangeRate = rate
         
         await db.commit()
+
+        # Trigger recalculation of monthly balances
+        if header.ExpDate:
+            try:
+                from ..services.opening_balance_service import get_or_create_monthly_balance
+                await get_or_create_monthly_balance(
+                    db=db,
+                    module_name="PETTY_CASH",
+                    org_id=header.OrgId or 1,
+                    branch_id=header.BranchId or 1,
+                    currency_id=header.currencyid,
+                    target_date=header.ExpDate
+                )
+            except Exception as e_bal:
+                print(f"Error recalculating monthly balance: {e_bal}")
+
         return {"status": True, "data": row_to_dict(obj)}
 
 
@@ -534,33 +582,34 @@ async def get_opening_balance(
     db: AsyncSession = Depends(get_db)
 ):
     try:
-        # 1. Net sum before from_date (Top-ups are positive, Expenses are negative)
-        balance_query = text(f"""
-            SELECT COALESCE(SUM(CASE WHEN category_id = 1 THEN amount ELSE -amount END), 0)
-            FROM {DB_NAME_FINANCE}.tbl_petty_cash
-            WHERE IsSubmitted = 1
-              AND OrgId = :orgid
-              AND BranchId = :branchid
-              AND expdate >= COALESCE(
-                  (SELECT MAX(expdate) 
-                   FROM {DB_NAME_FINANCE}.tbl_petty_cash 
-                   WHERE (pc_number LIKE '%OPENING%' OR ExpenseDescription LIKE '%OPENING%')
-                     AND expdate < :from_date
-                     AND IsSubmitted = 1
-                     AND OrgId = :orgid
-                     AND BranchId = :branchid),
-                  :from_date
-              )
-              AND expdate < :from_date
-              AND (currencyid = :curid OR :curid IS NULL OR :curid = 0)
-        """)
-        balance_res = await db.execute(balance_query, {"orgid": orgid, "branchid": branchid, "from_date": from_date, "curid": currencyid})
-        opening_balance = float(balance_res.scalar() or 0)
-        
-        return {"status": True, "opening_balance": opening_balance}
+        from ..services.opening_balance_service import get_or_create_monthly_balance
+        data = await get_or_create_monthly_balance(
+            db=db,
+            module_name="PETTY_CASH",
+            org_id=orgid,
+            branch_id=branchid,
+            currency_id=currencyid,
+            target_date=from_date
+        )
+        print(f"DEBUG get_opening_balance: target_date={from_date}, returned_data={data}")
+        op_debit = data.get("opening_debit", 0.0)
+        op_credit = data.get("opening_credit", 0.0)
+        balance = op_debit
+        return {"status": True, "opening_balance": balance, "opening_debit": op_debit, "opening_credit": op_credit}
     except Exception as e:
         import traceback
         return {"status": False, "message": str(e), "traceback": traceback.format_exc()}
+
+
+@router.get("/debug-balances")
+async def debug_balances(db: AsyncSession = Depends(get_db)):
+    """Temporary debug endpoint to view tbl_opening_balance_master rows."""
+    try:
+        res = await db.execute(text(f"SELECT * FROM {DB_NAME_FINANCE}.tbl_opening_balance_master ORDER BY balance_month"))
+        rows = res.fetchall()
+        return {"status": True, "data": [row_to_dict(r) for r in rows]}
+    except Exception as e:
+        return {"status": False, "message": str(e)}
 
 
 @router.get("/inspect-table")
