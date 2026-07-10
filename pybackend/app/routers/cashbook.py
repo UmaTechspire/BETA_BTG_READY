@@ -355,6 +355,16 @@ async def get_cash_book_report(
         print(f"Error fetching cash book report: {e}")
         return {"status": "error", "detail": str(e)}
 
+def get_voucher_no(receipt_id: int, transaction_type: str) -> str:
+    t = str(transaction_type or "").lower()
+    if t in ('receipt', 'deposit'):
+        return f"RV - {receipt_id}"
+    elif t in ('payment', 'transfer to pc book'):
+        return f"CV - {receipt_id}"
+    elif t == 'other income':
+        return f"RCV - {receipt_id}"
+    return str(receipt_id)
+
 # ==========================================
 # 2. TRANSACTIONAL ENDPOINTS (CREATE/UPDATE)
 # ==========================================
@@ -408,8 +418,28 @@ async def create_cash_receipt(payload: CreateCashReceiptRequest, db: AsyncSessio
             created_records.append(db_receipt)
 
         await db.commit()
+        updates_made = False
         for record in created_records:
             await db.refresh(record)
+            
+            # Update PV Number in tbl_claimAndpayment_header if posted and it's a CV
+            if record.is_posted and record.ar_id:
+                voucher_no = get_voucher_no(record.receipt_id, record.transaction_type)
+                if voucher_no.startswith("CV"):
+                    update_sql = text(f"""
+                        UPDATE {DB_NAME_FINANCE}.tbl_claimAndpayment_header 
+                        SET voucherno = :voucher_no, voucherid = :voucher_id
+                        WHERE Claim_ID = :claim_id
+                    """)
+                    await db.execute(update_sql, {
+                        "voucher_no": voucher_no,
+                        "voucher_id": record.receipt_id,
+                        "claim_id": record.ar_id
+                    })
+                    updates_made = True
+
+        if updates_made:
+            await db.commit()
             
         return {
             "status": "success", 
@@ -467,6 +497,23 @@ async def update_cash_receipt(receipt_id: int, payload: CreateCashReceiptRequest
             
         entry.updated_by = str(payload.userId)
         await db.commit()
+        
+        # Update PV Number in tbl_claimAndpayment_header if posted and it's a CV
+        if entry.is_posted and entry.ar_id:
+            voucher_no = get_voucher_no(entry.receipt_id, entry.transaction_type)
+            if voucher_no.startswith("CV"):
+                update_sql = text(f"""
+                    UPDATE {DB_NAME_FINANCE}.tbl_claimAndpayment_header 
+                    SET voucherno = :voucher_no, voucherid = :voucher_id
+                    WHERE Claim_ID = :claim_id
+                """)
+                await db.execute(update_sql, {
+                    "voucher_no": voucher_no,
+                    "voucher_id": entry.receipt_id,
+                    "claim_id": entry.ar_id
+                })
+                await db.commit()
+
         return {"status": "success"}
     except Exception as e:
         await db.rollback()
