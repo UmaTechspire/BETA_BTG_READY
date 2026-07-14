@@ -152,13 +152,14 @@ def save_hod_discussion(req: HodDiscussionRequest):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         # Fetch existing comment
-        cursor.execute("SELECT applicant_hod_comment, hod_discussed_count FROM tbl_claimAndpayment_header WHERE Claim_ID = %s", (req.claim_id,))
+        cursor.execute("SELECT applicant_hod_comment, hod_discussed_count, DepartmentId FROM tbl_claimAndpayment_header WHERE Claim_ID = %s", (req.claim_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Claim not found")
         
         existing_comment = row[0] or ""
         current_count = row[1] or 0
+        department_id = row[2] or 0
         new_count = current_count + 1
         
         if new_count == 4:
@@ -176,7 +177,9 @@ def save_hod_discussion(req: HodDiscussionRequest):
                     claim_hod_isapproved = 0,
                     claim_gm_isapproved = 0,
                     claim_director_isapproved = 0,
-                    is_delete_required = 1
+                    is_delete_required = 1,
+                    Claim_Discussed_Count = IFNULL(Claim_Discussed_Count, 0) + 1,
+                    IsSubmitted = CASE WHEN DepartmentId = 9 THEN 0 ELSE IsSubmitted END
                 WHERE Claim_ID = %s
             """
             cursor.execute(update_query, (new_count, new_comment, req.claim_id))
@@ -189,7 +192,9 @@ def save_hod_discussion(req: HodDiscussionRequest):
                 UPDATE tbl_claimAndpayment_header 
                 SET claim_hod_isdiscussed = 1, 
                     hod_discussed_count = %s, 
-                    applicant_hod_comment = %s
+                    applicant_hod_comment = %s,
+                    Claim_Discussed_Count = IFNULL(Claim_Discussed_Count, 0) + 1,
+                    IsSubmitted = CASE WHEN DepartmentId = 9 THEN 0 ELSE IsSubmitted END
                 WHERE Claim_ID = %s
             """
             cursor.execute(update_query, (new_count, new_comment, req.claim_id))
@@ -215,8 +220,22 @@ def save_applicant_reply(req: ApplicantReplyRequest):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         reply_entry = f"[{req.applicant_name} at {timestamp}]: {req.reply}"
         
-        # Fetch existing comment and Department
-        cursor.execute("SELECT applicant_hod_comment, applicant_gm_comment, DepartmentId FROM tbl_claimAndpayment_header WHERE Claim_ID = %s", (req.claim_id,))
+        live_db = os.getenv('DB_NAME_USER', 'btggasify_live')
+        
+        # Fetch existing comment, Department, and claimant's username
+        cursor.execute(f"""
+            SELECT 
+                ch.applicant_hod_comment, 
+                ch.applicant_gm_comment, 
+                ch.DepartmentId, 
+                u.username AS applicant_username,
+                IFNULL(ch.gm_discussed_count, 0) AS gm_discussed_count,
+                IFNULL(ch.hod_discussed_count, 0) AS hod_discussed_count
+            FROM tbl_claimAndpayment_header ch
+            LEFT JOIN {live_db}.users u ON u.id = ch.ApplicantId
+            WHERE ch.Claim_ID = %s
+        """, (req.claim_id,))
+        
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Claim not found")
@@ -224,43 +243,87 @@ def save_applicant_reply(req: ApplicantReplyRequest):
         existing_hod_comment = row[0] or ""
         existing_gm_comment = row[1] or ""
         department_id = row[2] or 0
+        applicant_username = row[3] or ""
+        gm_discussed_count = row[4]
+        hod_discussed_count = row[5]
         
+        is_sender_applicant = False
+        if applicant_username and req.applicant_name:
+            is_sender_applicant = (req.applicant_name.lower().strip() == applicant_username.lower().strip())
+            
         final_comment = ""
         msg = ""
 
-        if department_id != 9:
-            # Dept != 9: Discussion between Claimant <-> GM
-            new_comment = existing_gm_comment + "\n" + reply_entry if existing_gm_comment else reply_entry
-            
-            # Sent back to GM (Applicant replies)
-            # update applicant_gm_comment, IsSubmitted=1 (sent), claim_gm_isdiscussed=0 (pending GM view)
-            update_query = """
-                UPDATE tbl_claimAndpayment_header 
-                SET applicant_gm_comment = %s, 
-                    IsSubmitted = 1,
-                    claim_gm_isdiscussed = 0
-                WHERE Claim_ID = %s
-            """
-            cursor.execute(update_query, (new_comment, req.claim_id))
-            final_comment = new_comment
-            msg = "Reply sent to GM"
+        # Close cursor to ensure clean slate
+        cursor.close()
+        cursor = conn.cursor()
+
+        if is_sender_applicant:
+            # Claimant resubmitting/replying to comment -> Status becomes Posted (IsSubmitted = 1)
+            if department_id != 9:
+                new_comment = existing_gm_comment + "\n" + reply_entry if existing_gm_comment else reply_entry
+                update_query = """
+                    UPDATE tbl_claimAndpayment_header 
+                    SET applicant_gm_comment = %s, 
+                        IsSubmitted = 1,
+                        claim_gm_isdiscussed = 0
+                    WHERE Claim_ID = %s
+                """
+                cursor.execute(update_query, (new_comment, req.claim_id))
+                final_comment = new_comment
+                msg = "Reply sent to GM"
+            else:
+                new_comment = existing_hod_comment + "\n" + reply_entry if existing_hod_comment else reply_entry
+                update_query = """
+                    UPDATE tbl_claimAndpayment_header 
+                    SET applicant_hod_comment = %s, 
+                        IsSubmitted = 1,
+                        claim_hod_isdiscussed = 0
+                    WHERE Claim_ID = %s
+                """
+                cursor.execute(update_query, (new_comment, req.claim_id))
+                final_comment = new_comment
+                msg = "Reply sent to HOD"
         else:
-            # Dept = 9: Existing logic (Claimant <-> HOD)
-            new_comment = existing_hod_comment + "\n" + reply_entry if existing_hod_comment else reply_entry
-            
-            update_query = """
-                UPDATE tbl_claimAndpayment_header 
-                SET applicant_hod_comment = %s, 
-                    IsSubmitted = 1,
-                    claim_hod_isdiscussed = 0
-                WHERE Claim_ID = %s
-            """
-            cursor.execute(update_query, (new_comment, req.claim_id))
-            final_comment = new_comment
-            msg = "Reply sent to HOD"
+            # Approver (GM or HOD) sending subsequent comment -> Status becomes Saved (IsSubmitted = 0)
+            if department_id != 9:
+                new_comment = existing_gm_comment + "\n" + reply_entry if existing_gm_comment else reply_entry
+                new_gm_count = gm_discussed_count + 1
+                is_delete_required = 1 if new_gm_count > 3 else 0
+                
+                update_query = """
+                    UPDATE tbl_claimAndpayment_header 
+                    SET applicant_gm_comment = %s, 
+                        IsSubmitted = 0,
+                        claim_gm_isdiscussed = 1,
+                        gm_discussed_count = %s,
+                        Claim_Discussed_Count = IFNULL(Claim_Discussed_Count, 0) + 1,
+                        is_delete_required = CASE WHEN %s = 1 THEN 1 ELSE is_delete_required END
+                    WHERE Claim_ID = %s
+                """
+                cursor.execute(update_query, (new_comment, new_gm_count, is_delete_required, req.claim_id))
+                final_comment = new_comment
+                msg = "Discussion sent to applicant"
+            else:
+                new_comment = existing_hod_comment + "\n" + reply_entry if existing_hod_comment else reply_entry
+                new_hod_count = hod_discussed_count + 1
+                is_delete_required = 1 if new_hod_count > 3 else 0
+                
+                update_query = """
+                    UPDATE tbl_claimAndpayment_header 
+                    SET applicant_hod_comment = %s, 
+                        IsSubmitted = 0,
+                        claim_hod_isdiscussed = 1,
+                        hod_discussed_count = %s,
+                        Claim_Discussed_Count = IFNULL(Claim_Discussed_Count, 0) + 1,
+                        is_delete_required = CASE WHEN %s = 1 THEN 1 ELSE is_delete_required END
+                    WHERE Claim_ID = %s
+                """
+                cursor.execute(update_query, (new_comment, new_hod_count, is_delete_required, req.claim_id))
+                final_comment = new_comment
+                msg = "Discussion sent to applicant"
         
         conn.commit()
-        
         return {"status": True, "message": msg, "data": final_comment}
     except Exception as e:
         print(f"Error: {e}")
@@ -353,7 +416,8 @@ def save_hod_gm_discussion(req: DiscussionRequest):
                  params.append(current_gm_title + 1)
                  
                  # Send to Applicant
-                 # update_parts.append("IsSubmitted = 0")
+                 update_parts.append("IsSubmitted = 0")
+                 update_parts.append("Claim_Discussed_Count = IFNULL(Claim_Discussed_Count, 0) + 1")
                  
                  if is_third_count:
                     update_parts.append("is_delete_required = 1")
@@ -710,7 +774,7 @@ def get_all_claims(
                 ch.claimamountintc, 
                 IFNULL(ch.isclaimant_discussed,0) AS isclaimant_discussed,
                 CASE WHEN IFNULL(ch.claim_hod_isapproved,0)=0 AND (IFNULL(ch.Claim_Discussed_Count,0)>3 OR IFNULL(ch.PPP_Discussed_Count,0)>3 OR IFNULL(ch.pv_dis_count,0)>3 OR IFNULL(ch.IsSubmitted,0)=0) THEN 1 ELSE 0 END AS candelete,
-                CASE WHEN IFNULL(ch.ppp_gm_approvalone,0)=0 THEN 1 ELSE 0 END AS canedit,
+                CASE WHEN IFNULL(ch.ppp_gm_approvalone,0)=0 AND IFNULL(ch.Claim_Discussed_Count,0)<=3 THEN 1 ELSE 0 END AS canedit,
                 ch.totalamountinidr, ch.voucherid, ch.voucherno,
                 DATE_FORMAT(ch.PaymentDate, '%d-%b-%Y') AS paymentDate,
                 IFNULL(psh.PaymentNo,'') AS PaymentNo,
